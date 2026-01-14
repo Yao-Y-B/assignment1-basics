@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import os
+
+import einops
+import regex as re
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from secrets import token_bytes
+from typing import IO, Any, BinaryIO, Counter
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from einops import einsum
+
+from MyBPETokenizer import MyBPETokenizer
+from tests.conftest import n_queries
+from train_bpe import train_bpe, BPETokenizer
+from MyTransformer import MyLinear, MyEmbedding, MyRMSNorm, MySwiglu, MyRoPE
 
 
 def run_linear(
@@ -28,6 +38,9 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    linear = MyLinear(d_in, d_out)
+    linear.load_state_dict({"weight": weights})
+    return linear(in_features)
 
     raise NotImplementedError
 
@@ -36,7 +49,7 @@ def run_embedding(
     vocab_size: int,
     d_model: int,
     weights: Float[Tensor, " vocab_size d_model"],
-    token_ids: Int[Tensor, " ..."],
+    token_ids: Int[Tensor, "..."],
 ) -> Float[Tensor, " ... d_model"]:
     """
     Given the weights of an Embedding layer, get the embeddings for a batch of token ids.
@@ -50,7 +63,9 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
+    embedding = MyEmbedding(vocab_size, d_model)
+    embedding.load_state_dict({"weight": weights})
+    return embedding(token_ids)
     raise NotImplementedError
 
 
@@ -83,6 +98,11 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
+    swiglu = MySwiglu(d_model,d_ff)
+    swiglu.w1.data = w1_weight
+    swiglu.w2.data = w2_weight
+    swiglu.w3.data = w3_weight
+    return swiglu(in_features)
     raise NotImplementedError
 
 
@@ -104,6 +124,15 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
+    dot_product = einsum(Q, K, "... queries d_k, ... keys d_k -> ... queries keys")
+    d_k = Q.shape[-1]
+    scaled = dot_product / (d_k ** 0.5)
+    if mask is not None:
+        scaled = torch.where(mask, scaled, torch.tensor(float("-inf")))
+    sm = torch.nn.functional.softmax(scaled, -1)
+    attention = einsum(sm, V, "... q k, ... k v ->... q v")
+    return attention
+
     raise NotImplementedError
 
 
@@ -138,6 +167,36 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
+    L = in_features.shape[-2]
+    dk_all = q_proj_weight.shape[0]
+    h = num_heads
+    d_k = dk_all // h
+
+    Q_all = einsum(in_features, q_proj_weight,  "... d_in, d_k d_in -> ... d_k")
+    K_all = einsum(in_features, k_proj_weight,  "... d_in, d_k d_in -> ... d_k")
+    V_all = einsum(in_features, v_proj_weight,  "... d_in, d_k d_in -> ... d_k")
+    # (..., L, dk_all) --> (..., L, h, d_k)
+    Q = torch.reshape(Q_all, (*Q_all.shape[:-1],h, d_k))
+    K = torch.reshape(K_all, (*Q_all.shape[:-1],h, d_k))
+    V = torch.reshape(V_all, (*Q_all.shape[:-1],h, d_k))
+    # (..., h, L, d_k)
+    Q = torch.transpose(Q, -2, -3)
+    K = torch.transpose(K, -2, -3)
+    V = torch.transpose(V, -2, -3)
+
+    # rope = MyRoPE(theta=10000.0, d_k=d_k, max_seq_len=n_queries())
+    # Q = rope(Q)
+    # K = rope(K)
+    # V = rope(V)
+    # 注意mask的形状： 不是和Q一样， 而是得L*L
+    mask = torch.tril(torch.ones(L,L)).bool()
+    attention = run_scaled_dot_product_attention(Q, K, V, mask=mask)
+    # (..., L, h, d_k)
+    add_up = einops.rearrange(attention, "... h L d_k -> ... L (h d_k)")
+    # shape: [..., l, d_k]
+    result = einsum(add_up, o_proj_weight, "... l d_k, d_m d_k -> ... l d_m")
+    return result
+
     raise NotImplementedError
 
 
@@ -178,6 +237,37 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
+    L = in_features.shape[-2]
+    dk_all = q_proj_weight.shape[0]
+    h = num_heads
+    d_k = dk_all // h
+
+    Q_all = einsum(in_features, q_proj_weight, "... d_in, d_k d_in -> ... d_k")
+    K_all = einsum(in_features, k_proj_weight, "... d_in, d_k d_in -> ... d_k")
+    V_all = einsum(in_features, v_proj_weight, "... d_in, d_k d_in -> ... d_k")
+    # (..., L, dk_all) --> (..., L, h, d_k)
+    Q = torch.reshape(Q_all, (*Q_all.shape[:-1], h, d_k))
+    K = torch.reshape(K_all, (*Q_all.shape[:-1], h, d_k))
+    V = torch.reshape(V_all, (*Q_all.shape[:-1], h, d_k))
+    # (..., h, L, d_k)
+    Q = torch.transpose(Q, -2, -3)
+    K = torch.transpose(K, -2, -3)
+    V = torch.transpose(V, -2, -3)
+
+    rope = MyRoPE(theta, d_k, max_seq_len)
+    Q = rope(Q, token_positions)
+    K = rope(K, token_positions)
+    # V = rope(V, token_positions)
+
+    # 注意mask的形状： 不是和Q一样， 而是得L*L
+    mask = torch.tril(torch.ones(L, L)).bool()
+    attention = run_scaled_dot_product_attention(Q, K, V, mask=mask)
+
+    # (..., L, h, d_k)
+    add_up = einops.rearrange(attention, "... h L d_k -> ... L (h d_k)")
+    # shape: [..., l, d_k]
+    result = einsum(add_up, o_proj_weight, "... l d_k, d_m d_k -> ... l d_m")
+    return result
     raise NotImplementedError
 
 
@@ -200,6 +290,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
+    rope = MyRoPE(theta, d_k, max_seq_len)
+    return rope(in_query_or_key, token_positions)
     raise NotImplementedError
 
 
@@ -361,7 +453,7 @@ def run_transformer_lm(
 def run_rmsnorm(
     d_model: int,
     eps: float,
-    weights: Float[Tensor, " d_model"],
+    weights: Float[Tensor, "d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
     """Given the weights of a RMSNorm affine transform,
@@ -378,10 +470,13 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
+    rmsnorm = MyRMSNorm(d_model,eps)
+    rmsnorm.load_state_dict({"weight": weights})
+    return rmsnorm(in_features)
     raise NotImplementedError
 
 
-def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
+def run_silu(in_features: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
     """Given a tensor of inputs, return the output of applying SiLU
     to each element.
 
@@ -417,8 +512,13 @@ def run_get_batch(
     """
     raise NotImplementedError
 
+def softmax(x: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:
+    max_val = torch.max(x, dim=dim, keepdim=True)[0]
+    shifted_input = x - max_val
+    exp_sum = torch.sum(torch.exp(shifted_input), dim=dim, keepdim=True)
+    return torch.exp(shifted_input) / exp_sum
 
-def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+def run_softmax(in_features: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:
     """
     Given a tensor of inputs, return the output of softmaxing the given `dim`
     of the input.
@@ -431,11 +531,13 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
+    return softmax(in_features, dim=dim)
+
     raise NotImplementedError
 
 
 def run_cross_entropy(
-    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, "batch_size"]
 ) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
@@ -559,6 +661,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
+    return MyBPETokenizer(vocab,merges,special_tokens)
     raise NotImplementedError
 
 
@@ -581,12 +684,22 @@ def run_train_bpe(
 
     Returns:
         tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
+            vocab dict[int, token_bytes]:
                 The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
                 to bytes (token bytes)
-            merges:
+            merges   list[tuple[bytes, bytes]]:
                 BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    pattern = "|".join(re.escape(special_token) for special_token in special_tokens)
+
+    corpus_tokens: list[list[bytes]] = []  # 要反复用的语料序列
+    vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
+
+    return vocab, merges
+
     raise NotImplementedError
