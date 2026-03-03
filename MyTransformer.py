@@ -88,6 +88,9 @@ class MyRoPE(torch.nn.Module):
 
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        if token_positions is None:
+            token_positions = torch.arange(x.shape[-2])
+
         D = x.shape[-1]
         pair_dim = 2*floor(D // 2)
 

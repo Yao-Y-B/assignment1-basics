@@ -365,6 +365,33 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
+
+    # sublayer1 : rmsnorm + mha
+    rmsnorm = MyRMSNorm(d_model)
+    rmsnorm.load_state_dict({"weight": weights['ln1.weight']})
+    in_features_rmsnorm = rmsnorm(in_features)
+
+    out_features_a = run_multihead_self_attention_with_rope(d_model, num_heads, max_seq_len,theta, weights['attn.q_proj.weight'],
+                                                            weights['attn.k_proj.weight'],weights['attn.v_proj.weight'],weights['attn.output_proj.weight'],
+                                                            in_features_rmsnorm)
+    out_features = out_features_a + in_features
+
+    # sublayer2: rmsnorm+ff
+    rmsnorm_2 = MyRMSNorm(d_model)
+    rmsnorm_2.load_state_dict({"weight": weights['ln2.weight']})
+    in_features_rmsnorm_2 = rmsnorm_2(out_features)
+    swiglu = MySwiglu(d_model, d_ff)
+    swiglu.w1.data = weights['ffn.w1.weight']
+    swiglu.w2.data = weights['ffn.w2.weight']
+    swiglu.w3.data = weights['ffn.w3.weight']
+
+    out_features_swiglu = swiglu(in_features_rmsnorm_2)
+
+    result = out_features + out_features_swiglu
+
+    return result
+
+
     raise NotImplementedError
 
 
@@ -447,6 +474,33 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
+    embedding_layer = MyEmbedding(vocab_size, d_model)
+    embedding_layer.load_state_dict({"weight": weights['token_embeddings.weight']})
+    input = embedding_layer(in_indices)
+
+    for i in range(num_layers):
+        index = f"layers.{i}."
+        layer_weights = {
+            k[len(index):]: v
+            for k, v in weights.items()
+            if k.startswith(index)
+        }
+        input = run_transformer_block(d_model, num_heads, d_ff, context_length,
+                                      rope_theta, layer_weights,input)
+
+    rmsnorm = MyRMSNorm(d_model)
+    rmsnorm.load_state_dict({"weight": weights['ln_final.weight']})
+    normed_input = rmsnorm(input)
+
+    linear = MyLinear(d_model, vocab_size)
+    linear.load_state_dict({"weight": weights['lm_head.weight']})
+    linear_output = linear(normed_input)
+
+    # output = torch.nn.functional.softmax(linear_output, dim=-1)
+
+    return linear_output
+
+
     raise NotImplementedError
 
 
