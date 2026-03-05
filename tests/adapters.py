@@ -13,6 +13,7 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from einops import einsum
+from torch.nn.parallel.comm import gather
 
 from MyBPETokenizer import MyBPETokenizer
 from tests.conftest import n_queries
@@ -605,7 +606,33 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    # inputs =
+    # tensor([[2.0, 1.0, 0.1],
+    #         [0.5, 2.5, 0.3]])
+    # [2,3]
+    #  targets [0,1]
+
+    max_logits = inputs.max(dim=-1, keepdim=True).values
+    #tensor([[2.0],
+    #        [2.5]])
+
+    shifted_inputs = inputs - max_logits
+    # tensor([[0.0, -1.5, -1.9],
+    #         [-2.0, 0.0, -2.2]])
+    log_sum_exp = max_logits + torch.log(torch.sum(torch.exp(shifted_inputs), dim=-1, keepdim=True))
+    # max_logits.squeeze(-1) : [2.0,2.5]
+    # torch.exp(shifted_inputs): 换成exp值, [2,3]
+    # torch.sum(torch.exp(shifted_inputs), dim=-1, keepdim=True): [[sum1], [sum2]]
+    #  log_sum_exp: [2.0+sum1, 2.5+sum2]
+    target_logits = inputs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    # targets.unsqueeze(-1) : [0,1] --> [[0],[1]]
+    # inputs.gather(dim=-1, index=targets.unsqueeze(-1)) : [[2.0], [2.5]]
+    # target_logits: [2.0, 2.5]
+    loss = -target_logits + log_sum_exp
+
+    return loss.mean()
+
+    raise NotImplementedError3.666666666666666666666666666666666666666666666666666666.
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
